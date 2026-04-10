@@ -1,5 +1,9 @@
 'use strict';
 
+const CLIENT_ID = '585463306650-pqr0kjh8pibvqi6u0o92a83fcef52iov.apps.googleusercontent.com';
+const SCOPES = 'https://www.googleapis.com/auth/photoslibrary.readonly';
+const STORAGE_KEY = 'japan-travel-photos-v2';
+
 const REGIONS_ORDER = ["北海道","東北","関東","中部","近畿","中国","四国","九州","沖縄"];
 const PREF_INFO = {
   "1":"北海道","2":"青森県","3":"岩手県","4":"宮城県","5":"秋田県","6":"山形県","7":"福島県",
@@ -22,38 +26,7 @@ const PREF_REGION = {
   "45":"九州","46":"九州","47":"沖縄"
 };
 
-const STORAGE_KEY = 'japan-travel-photos';
 const padCode = c => String(c).padStart(2,'0');
-
-// ── Web用 ストレージ（localStorage）────────────────────────────────
-const webApi = {
-  loadStore: () => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch(e) { return {}; }
-  },
-  saveStore: (data) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch(e) {}
-  },
-  openImages: () => new Promise(resolve => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.multiple = true;
-    input.onchange = async () => {
-      const files = Array.from(input.files);
-      const results = await Promise.all(files.map(f => new Promise(res => {
-        const reader = new FileReader();
-        reader.onload = e => res({ data: e.target.result, name: f.name });
-        reader.readAsDataURL(f);
-      })));
-      resolve(results);
-    };
-    input.oncancel = () => resolve([]);
-    input.click();
-  })
-};
 
 let store = {};
 let currentPref = null;
@@ -61,30 +34,217 @@ let lbIndex = 0, lbPhotos = [];
 let scale = 1, offX = 0, offY = 0;
 let dragging = false, dragStart = {x:0,y:0};
 let prefEls = {};
+let accessToken = null;
+let gpPhotos = []; // Google Photos picker results
+let gpPage = 1;
+let gpNextPageToken = null;
+let gpLoading = false;
 
 const $ = id => document.getElementById(id);
 
-function init() {
-  store = webApi.loadStore();
-  setupMap();
-  buildNav('');
-  bindDrag();
-  bindZoom();
-  bindLightbox();
-  $('search-input').addEventListener('input', () => buildNav($('search-input').value));
+// ── ストレージ ────────────────────────────────────────────────────
+function loadStore() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}'); } catch(e) { return {}; }
+}
+function saveStore() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch(e) {}
 }
 
+// ── Google Identity Services ──────────────────────────────────────
+function initGoogleAuth() {
+  if (!window.google) return;
+  window.tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: (resp) => {
+      if (resp.error) { showMsg('Googleログインに失敗しました'); return; }
+      accessToken = resp.access_token;
+      updateAuthUI(true);
+      showMsg('Googleフォトに接続しました');
+    }
+  });
+}
+
+function loginGoogle() {
+  if (!window.tokenClient) { showMsg('Google認証ライブラリを読み込み中です'); return; }
+  window.tokenClient.requestAccessToken();
+}
+
+function logoutGoogle() {
+  if (accessToken) {
+    google.accounts.oauth2.revoke(accessToken, () => {});
+    accessToken = null;
+  }
+  updateAuthUI(false);
+  closeGpModal();
+}
+
+function updateAuthUI(loggedIn) {
+  $('btn-login').style.display = loggedIn ? 'none' : 'flex';
+  $('btn-logout').style.display = loggedIn ? 'flex' : 'none';
+  $('btn-gp-pick').style.display = loggedIn ? 'flex' : 'none';
+}
+
+// ── Google Photos API ─────────────────────────────────────────────
+async function fetchGpPhotos(pageToken) {
+  if (!accessToken) return;
+  gpLoading = true;
+  updateGpLoading(true);
+  try {
+    let url = 'https://photoslibrary.googleapis.com/v1/mediaItems?pageSize=50';
+    if (pageToken) url += '&pageToken=' + pageToken;
+    const res = await fetch(url, {
+      headers: { Authorization: 'Bearer ' + accessToken }
+    });
+    if (!res.ok) {
+      if (res.status === 401) { accessToken = null; updateAuthUI(false); showMsg('再度ログインしてください'); return; }
+      throw new Error('API error ' + res.status);
+    }
+    const data = await res.json();
+    gpNextPageToken = data.nextPageToken || null;
+    return data.mediaItems || [];
+  } catch(e) {
+    showMsg('写真の取得に失敗しました: ' + e.message);
+    return [];
+  } finally {
+    gpLoading = false;
+    updateGpLoading(false);
+  }
+}
+
+function updateGpLoading(on) {
+  const el = $('gp-loading');
+  if (el) el.style.display = on ? 'flex' : 'none';
+}
+
+// ── Google Photos モーダル ────────────────────────────────────────
+async function openGpModal() {
+  if (!accessToken) { loginGoogle(); return; }
+  $('gp-modal').style.display = 'flex';
+  gpPhotos = [];
+  gpNextPageToken = null;
+  $('gp-grid').innerHTML = '';
+  $('gp-load-more').style.display = 'none';
+  const items = await fetchGpPhotos();
+  if (items) appendGpItems(items);
+}
+
+function closeGpModal() {
+  $('gp-modal').style.display = 'none';
+}
+
+function appendGpItems(items) {
+  const grid = $('gp-grid');
+  items.forEach(item => {
+    gpPhotos.push(item);
+    const div = document.createElement('div');
+    div.className = 'gp-item';
+    div.dataset.id = item.id;
+
+    // サムネイル（画像・動画共通）
+    const isVideo = item.mediaMetadata && item.mediaMetadata.video;
+    const thumbUrl = item.baseUrl + '=w200-h200-c';
+    div.innerHTML = `
+      <img src="${thumbUrl}" alt="" loading="lazy">
+      ${isVideo ? '<span class="gp-video-badge">▶ 動画</span>' : ''}
+    `;
+    div.addEventListener('click', () => toggleGpSelect(div, item));
+    grid.appendChild(div);
+  });
+
+  // もっと読み込むボタン
+  $('gp-load-more').style.display = gpNextPageToken ? 'block' : 'none';
+}
+
+function toggleGpSelect(div, item) {
+  div.classList.toggle('selected');
+}
+
+async function loadMoreGp() {
+  if (!gpNextPageToken || gpLoading) return;
+  const items = await fetchGpPhotos(gpNextPageToken);
+  if (items) appendGpItems(items);
+}
+
+async function addSelectedGpPhotos() {
+  const selected = $('gp-grid').querySelectorAll('.gp-item.selected');
+  if (!selected.length) { showMsg('写真を選択してください'); return; }
+
+  const code = padCode(currentPref);
+  if (!store[code]) store[code] = [];
+
+  $('gp-add-btn').textContent = '追加中...';
+  $('gp-add-btn').disabled = true;
+
+  for (const div of selected) {
+    const item = gpPhotos.find(p => p.id === div.dataset.id);
+    if (!item) continue;
+    const isVideo = item.mediaMetadata && item.mediaMetadata.video;
+    // 動画はダウンロードURL、画像は高解像度URL
+    const url = isVideo
+      ? item.baseUrl + '=dv'
+      : item.baseUrl + '=w1600-h1600';
+    store[code].push({ type: isVideo ? 'video' : 'image', url, id: item.id });
+  }
+
+  saveStore();
+  renderPhotos();
+  if (prefEls[currentPref])
+    prefEls[currentPref].classList.toggle('has-photos', store[code].length > 0);
+  buildNav($('search-input').value);
+  closeGpModal();
+  $('gp-add-btn').textContent = '追加する';
+  $('gp-add-btn').disabled = false;
+  showMsg(selected.length + '件を追加しました');
+}
+
+// ── ローカルファイル追加 ──────────────────────────────────────────
+function openLocalPicker() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*,video/*,.heic,.heif';
+  input.multiple = true;
+  input.onchange = async () => {
+    const code = padCode(currentPref);
+    if (!store[code]) store[code] = [];
+    const files = Array.from(input.files);
+    for (const f of files) {
+      const isVideo = f.type.startsWith('video/');
+      const data = await new Promise(res => {
+        const r = new FileReader();
+        r.onload = e => res(e.target.result);
+        r.readAsDataURL(f);
+      });
+      store[code].push({ type: isVideo ? 'video' : 'image', url: data, id: Date.now() + Math.random() });
+    }
+    saveStore();
+    renderPhotos();
+    if (prefEls[currentPref])
+      prefEls[currentPref].classList.toggle('has-photos', store[code].length > 0);
+    buildNav($('search-input').value);
+  };
+  input.click();
+}
+
+// ── トースト通知 ──────────────────────────────────────────────────
+function showMsg(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── 地図セットアップ ──────────────────────────────────────────────
 function setupMap() {
-  const groups = document.querySelectorAll('[data-code]');
-  groups.forEach(g => {
+  document.querySelectorAll('[data-code]').forEach(g => {
     const raw = g.getAttribute('data-code');
-    const name = PREF_INFO[raw];
-    if (!name) return;
+    if (!PREF_INFO[raw]) return;
     g.classList.add('pref-group');
-    if ((store[padCode(raw)]||[]).length > 0) g.classList.add('has-photos');
+    const code = padCode(raw);
+    if ((store[code]||[]).length > 0) g.classList.add('has-photos');
     g.addEventListener('mouseenter', () => {
-      const count = (store[padCode(raw)]||[]).length;
-      $('tooltip').innerHTML = name + (count ? `<span class="t-count">${count}枚</span>` : '');
+      const count = (store[code]||[]).length;
+      $('tooltip').innerHTML = PREF_INFO[raw] + (count ? `<span class="t-count">${count}件</span>` : '');
       $('tooltip').style.opacity = '1';
     });
     g.addEventListener('mousemove', e => {
@@ -98,6 +258,7 @@ function setupMap() {
   });
 }
 
+// ── ナビ ──────────────────────────────────────────────────────────
 function buildNav(query) {
   const sec = $('region-sections');
   sec.innerHTML = '';
@@ -126,9 +287,10 @@ function buildNav(query) {
   });
   let total = 0;
   Object.values(store).forEach(a => total += a.length);
-  $('total-count').textContent = total + ' 枚の写真';
+  $('total-count').textContent = total + ' 件';
 }
 
+// ── ズーム・ドラッグ ──────────────────────────────────────────────
 function applyTransform() {
   $('map-inner').style.transform = `translate(${offX}px,${offY}px) scale(${scale})`;
 }
@@ -151,12 +313,12 @@ function bindDrag() {
   });
   document.addEventListener('mousemove', e => {
     if (!dragging) return;
-    offX=e.clientX-dragStart.x; offY=e.clientY-dragStart.y;
-    applyTransform();
+    offX=e.clientX-dragStart.x; offY=e.clientY-dragStart.y; applyTransform();
   });
   document.addEventListener('mouseup', () => { dragging=false; $('map-stage').classList.remove('dragging'); });
 }
 
+// ── 画面遷移 ──────────────────────────────────────────────────────
 function showMapView() {
   $('map-view').classList.add('active');
   $('pref-view').classList.remove('active');
@@ -176,50 +338,90 @@ function openPref(raw) {
   buildNav($('search-input').value);
 }
 
+// ── 写真表示 ──────────────────────────────────────────────────────
 function renderPhotos() {
   const code = padCode(currentPref);
-  const photos = store[code]||[];
-  const grid=$('photo-grid'), empty=$('empty-photos');
-  grid.innerHTML='';
+  const photos = store[code] || [];
+  const grid = $('photo-grid'), empty = $('empty-photos');
+  grid.innerHTML = '';
   if (!photos.length) { empty.classList.add('show'); grid.style.display='none'; return; }
   empty.classList.remove('show'); grid.style.display='';
-  photos.forEach((src,i) => {
-    const card=document.createElement('div'); card.className='photo-card';
-    const img=document.createElement('img'); img.src=src; img.alt=''; img.loading='lazy';
-    img.addEventListener('click', ()=>openLightbox(i));
-    const del=document.createElement('button'); del.className='del-btn'; del.textContent='✕';
-    del.addEventListener('click', e=>{e.stopPropagation();deletePhoto(i);});
-    card.appendChild(img); card.appendChild(del); grid.appendChild(card);
+
+  photos.forEach((item, i) => {
+    const card = document.createElement('div');
+    card.className = 'photo-card';
+    if (item.type === 'video') {
+      const vid = document.createElement('video');
+      vid.src = item.url;
+      vid.controls = false;
+      vid.muted = true;
+      vid.loop = true;
+      vid.setAttribute('playsinline','');
+      vid.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+      vid.addEventListener('mouseenter', () => vid.play());
+      vid.addEventListener('mouseleave', () => { vid.pause(); vid.currentTime=0; });
+      vid.addEventListener('click', () => openLightbox(i));
+      const badge = document.createElement('span');
+      badge.className = 'video-badge';
+      badge.textContent = '▶';
+      card.appendChild(vid);
+      card.appendChild(badge);
+    } else {
+      const img = document.createElement('img');
+      img.src = item.url; img.alt=''; img.loading='lazy';
+      img.addEventListener('click', () => openLightbox(i));
+      card.appendChild(img);
+    }
+    const del = document.createElement('button');
+    del.className = 'del-btn'; del.textContent = '✕';
+    del.addEventListener('click', e => { e.stopPropagation(); deletePhoto(i); });
+    card.appendChild(del);
+    grid.appendChild(card);
   });
 }
-async function addPhotos() {
-  const files = await webApi.openImages();
-  if (!files.length) return;
-  const code = padCode(currentPref);
-  if (!store[code]) store[code]=[];
-  files.forEach(f => store[code].push(f.data));
-  webApi.saveStore(store);
-  renderPhotos();
-  if (prefEls[currentPref]) prefEls[currentPref].classList.toggle('has-photos', store[code].length>0);
-  buildNav($('search-input').value);
-}
+
 function deletePhoto(i) {
-  const code=padCode(currentPref);
+  const code = padCode(currentPref);
   store[code].splice(i,1);
-  webApi.saveStore(store);
+  saveStore();
   renderPhotos();
-  if (prefEls[currentPref]) prefEls[currentPref].classList.toggle('has-photos',(store[code]||[]).length>0);
+  if (prefEls[currentPref])
+    prefEls[currentPref].classList.toggle('has-photos',(store[code]||[]).length>0);
   buildNav($('search-input').value);
 }
 
-function openLightbox(i) { lbPhotos=store[padCode(currentPref)]||[]; lbIndex=i; showLb(); $('lightbox').classList.add('open'); }
-function showLb() { $('lb-img').src=lbPhotos[lbIndex]; $('lb-caption').textContent=(lbIndex+1)+' / '+lbPhotos.length; }
+// ── ライトボックス ────────────────────────────────────────────────
+function openLightbox(i) {
+  lbPhotos = store[padCode(currentPref)] || [];
+  lbIndex = i;
+  showLb();
+  $('lightbox').classList.add('open');
+}
+function showLb() {
+  const item = lbPhotos[lbIndex];
+  const lbContent = $('lb-content');
+  lbContent.innerHTML = '';
+  if (item.type === 'video') {
+    const vid = document.createElement('video');
+    vid.src = item.url;
+    vid.controls = true;
+    vid.autoplay = true;
+    vid.style.cssText = 'max-width:82vw;max-height:82vh;border-radius:8px;display:block;';
+    lbContent.appendChild(vid);
+  } else {
+    const img = document.createElement('img');
+    img.src = item.url;
+    img.style.cssText = 'max-width:82vw;max-height:82vh;border-radius:8px;display:block;object-fit:contain;';
+    lbContent.appendChild(img);
+  }
+  $('lb-caption').textContent = (lbIndex+1) + ' / ' + lbPhotos.length;
+}
 function bindLightbox() {
-  $('lb-close').addEventListener('click', ()=>$('lightbox').classList.remove('open'));
-  $('lb-backdrop').addEventListener('click', ()=>$('lightbox').classList.remove('open'));
-  $('lb-prev').addEventListener('click', ()=>{ lbIndex=(lbIndex-1+lbPhotos.length)%lbPhotos.length; showLb(); });
-  $('lb-next').addEventListener('click', ()=>{ lbIndex=(lbIndex+1)%lbPhotos.length; showLb(); });
-  document.addEventListener('keydown', e=>{
+  $('lb-close').addEventListener('click', () => $('lightbox').classList.remove('open'));
+  $('lb-backdrop').addEventListener('click', () => $('lightbox').classList.remove('open'));
+  $('lb-prev').addEventListener('click', () => { lbIndex=(lbIndex-1+lbPhotos.length)%lbPhotos.length; showLb(); });
+  $('lb-next').addEventListener('click', () => { lbIndex=(lbIndex+1)%lbPhotos.length; showLb(); });
+  document.addEventListener('keydown', e => {
     if (!$('lightbox').classList.contains('open')) return;
     if (e.key==='Escape') $('lightbox').classList.remove('open');
     if (e.key==='ArrowLeft') { lbIndex=(lbIndex-1+lbPhotos.length)%lbPhotos.length; showLb(); }
@@ -227,8 +429,50 @@ function bindLightbox() {
   });
 }
 
-$('back-btn').addEventListener('click', showMapView);
-$('add-photo-btn').addEventListener('click', addPhotos);
-$('empty-add-btn').addEventListener('click', addPhotos);
+// ── イベントバインド ──────────────────────────────────────────────
+function bindEvents() {
+  $('back-btn').addEventListener('click', showMapView);
+  $('add-photo-btn').addEventListener('click', () => {
+    $('add-menu').classList.toggle('open');
+  });
+  $('menu-local').addEventListener('click', () => { $('add-menu').classList.remove('open'); openLocalPicker(); });
+  $('menu-gp').addEventListener('click', () => { $('add-menu').classList.remove('open'); openGpModal(); });
+  $('empty-add-btn').addEventListener('click', () => {
+    if (accessToken) openGpModal(); else openLocalPicker();
+  });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#add-photo-btn') && !e.target.closest('#add-menu'))
+      $('add-menu').classList.remove('open');
+  });
+  $('btn-login').addEventListener('click', loginGoogle);
+  $('btn-logout').addEventListener('click', logoutGoogle);
+  $('btn-gp-pick').addEventListener('click', openGpModal);
+  $('gp-close').addEventListener('click', closeGpModal);
+  $('gp-modal-backdrop').addEventListener('click', closeGpModal);
+  $('gp-add-btn').addEventListener('click', addSelectedGpPhotos);
+  $('gp-load-more').addEventListener('click', loadMoreGp);
+  $('search-input').addEventListener('input', () => buildNav($('search-input').value));
+}
+
+// ── 初期化 ────────────────────────────────────────────────────────
+function init() {
+  store = loadStore();
+  setupMap();
+  buildNav('');
+  bindZoom();
+  bindDrag();
+  bindLightbox();
+  bindEvents();
+  // Google Identity Services読み込み後に初期化
+  if (window.google) initGoogleAuth();
+  else window.addEventListener('google-loaded', initGoogleAuth);
+}
+
+window.addEventListener('load', () => {
+  const s = document.createElement('script');
+  s.src = 'https://accounts.google.com/gsi/client';
+  s.onload = () => { window.dispatchEvent(new Event('google-loaded')); initGoogleAuth(); };
+  document.head.appendChild(s);
+});
 
 init();
