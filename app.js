@@ -1,8 +1,8 @@
 'use strict';
 
 const CLIENT_ID = '585463306650-pqr0kjh8pibvqi6u0o92a83fcef52iov.apps.googleusercontent.com';
-const SCOPES = 'https://www.googleapis.com/auth/photoslibrary.readonly';
-const STORAGE_KEY = 'japan-travel-photos-v2';
+const SCOPES = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.metadata.readonly';
+const STORAGE_KEY = 'japan-travel-photos-v3';
 
 const REGIONS_ORDER = ["北海道","東北","関東","中部","近畿","中国","四国","九州","沖縄"];
 const PREF_INFO = {
@@ -35,10 +35,9 @@ let scale = 1, offX = 0, offY = 0;
 let dragging = false, dragStart = {x:0,y:0};
 let prefEls = {};
 let accessToken = null;
-let gpPhotos = []; // Google Photos picker results
-let gpPage = 1;
-let gpNextPageToken = null;
-let gpLoading = false;
+let driveFiles = [];
+let driveNextPageToken = null;
+let driveLoading = false;
 
 const $ = id => document.getElementById(id);
 
@@ -50,141 +49,179 @@ function saveStore() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch(e) {}
 }
 
-// ── Google Identity Services ──────────────────────────────────────
+// ── Google認証 ────────────────────────────────────────────────────
 function initGoogleAuth() {
   if (!window.google) return;
   window.tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: SCOPES,
     callback: (resp) => {
-      if (resp.error) { showMsg('Googleログインに失敗しました'); return; }
+      if (resp.error) { showMsg('ログインに失敗しました'); return; }
       accessToken = resp.access_token;
       updateAuthUI(true);
-      showMsg('Googleフォトに接続しました');
+      showMsg('Googleドライブに接続しました');
     }
   });
 }
 
 function loginGoogle() {
-  if (!window.tokenClient) { showMsg('Google認証ライブラリを読み込み中です'); return; }
+  if (!window.tokenClient) { showMsg('認証ライブラリを読み込み中です'); return; }
   window.tokenClient.requestAccessToken();
 }
 
 function logoutGoogle() {
-  if (accessToken) {
-    google.accounts.oauth2.revoke(accessToken, () => {});
-    accessToken = null;
-  }
+  if (accessToken) { google.accounts.oauth2.revoke(accessToken, ()=>{}); accessToken = null; }
   updateAuthUI(false);
-  closeGpModal();
+  closeDriveModal();
 }
 
 function updateAuthUI(loggedIn) {
   $('btn-login').style.display = loggedIn ? 'none' : 'flex';
   $('btn-logout').style.display = loggedIn ? 'flex' : 'none';
-  $('btn-gp-pick').style.display = loggedIn ? 'flex' : 'none';
+  $('btn-drive-pick').style.display = loggedIn ? 'flex' : 'none';
 }
 
-// ── Google Photos API ─────────────────────────────────────────────
-async function fetchGpPhotos(pageToken) {
-  if (!accessToken) return;
-  gpLoading = true;
-  updateGpLoading(true);
+// ── Google Drive API ──────────────────────────────────────────────
+async function fetchDriveFiles(pageToken, folderId) {
+  if (!accessToken) return [];
+  driveLoading = true;
+  updateDriveLoading(true);
   try {
-    let url = 'https://photoslibrary.googleapis.com/v1/mediaItems?pageSize=50';
+    // 画像・動画・HEICを取得
+    let q = "(mimeType contains 'image/' or mimeType contains 'video/' or mimeType='image/heic' or mimeType='image/heif') and trashed=false";
+    if (folderId) q += ` and '${folderId}' in parents`;
+
+    let url = `https://www.googleapis.com/drive/v3/files?pageSize=50&fields=nextPageToken,files(id,name,mimeType,thumbnailLink,webContentLink)&q=${encodeURIComponent(q)}`;
     if (pageToken) url += '&pageToken=' + pageToken;
-    const res = await fetch(url, {
-      headers: { Authorization: 'Bearer ' + accessToken }
-    });
+
+    const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
     if (!res.ok) {
-      if (res.status === 401) { accessToken = null; updateAuthUI(false); showMsg('再度ログインしてください'); return; }
-      throw new Error('API error ' + res.status);
+      if (res.status === 401) { accessToken = null; updateAuthUI(false); showMsg('再度ログインしてください'); return []; }
+      throw new Error('Drive API error ' + res.status);
     }
     const data = await res.json();
-    gpNextPageToken = data.nextPageToken || null;
-    return data.mediaItems || [];
+    driveNextPageToken = data.nextPageToken || null;
+    return data.files || [];
   } catch(e) {
-    showMsg('写真の取得に失敗しました: ' + e.message);
+    showMsg('ファイル取得に失敗: ' + e.message);
     return [];
   } finally {
-    gpLoading = false;
-    updateGpLoading(false);
+    driveLoading = false;
+    updateDriveLoading(false);
   }
 }
 
-function updateGpLoading(on) {
-  const el = $('gp-loading');
+// フォルダ一覧取得
+async function fetchDriveFolders() {
+  if (!accessToken) return [];
+  try {
+    const q = "mimeType='application/vnd.google-apps.folder' and trashed=false";
+    const url = `https://www.googleapis.com/drive/v3/files?pageSize=50&fields=files(id,name)&q=${encodeURIComponent(q)}&orderBy=name`;
+    const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.files || [];
+  } catch(e) { return []; }
+}
+
+function updateDriveLoading(on) {
+  const el = $('drive-loading');
   if (el) el.style.display = on ? 'flex' : 'none';
 }
 
-// ── Google Photos モーダル ────────────────────────────────────────
-async function openGpModal() {
+// ── Driveモーダル ─────────────────────────────────────────────────
+async function openDriveModal() {
   if (!accessToken) { loginGoogle(); return; }
-  $('gp-modal').style.display = 'flex';
-  gpPhotos = [];
-  gpNextPageToken = null;
-  $('gp-grid').innerHTML = '';
-  $('gp-load-more').style.display = 'none';
-  const items = await fetchGpPhotos();
-  if (items) appendGpItems(items);
-}
+  $('drive-modal').style.display = 'flex';
+  driveFiles = [];
+  driveNextPageToken = null;
+  $('drive-grid').innerHTML = '';
+  $('drive-load-more').style.display = 'none';
 
-function closeGpModal() {
-  $('gp-modal').style.display = 'none';
-}
-
-function appendGpItems(items) {
-  const grid = $('gp-grid');
-  items.forEach(item => {
-    gpPhotos.push(item);
-    const div = document.createElement('div');
-    div.className = 'gp-item';
-    div.dataset.id = item.id;
-
-    // サムネイル（画像・動画共通）
-    const isVideo = item.mediaMetadata && item.mediaMetadata.video;
-    const thumbUrl = item.baseUrl + '=w200-h200-c';
-    div.innerHTML = `
-      <img src="${thumbUrl}" alt="" loading="lazy">
-      ${isVideo ? '<span class="gp-video-badge">▶ 動画</span>' : ''}
-    `;
-    div.addEventListener('click', () => toggleGpSelect(div, item));
-    grid.appendChild(div);
+  // フォルダ一覧を取得してセレクタに設定
+  const folders = await fetchDriveFolders();
+  const sel = $('folder-select');
+  sel.innerHTML = '<option value="">すべてのファイル</option>';
+  folders.forEach(f => {
+    const opt = document.createElement('option');
+    opt.value = f.id;
+    opt.textContent = f.name;
+    sel.appendChild(opt);
   });
 
-  // もっと読み込むボタン
-  $('gp-load-more').style.display = gpNextPageToken ? 'block' : 'none';
+  const files = await fetchDriveFiles(null, null);
+  appendDriveFiles(files);
 }
 
-function toggleGpSelect(div, item) {
-  div.classList.toggle('selected');
+function closeDriveModal() {
+  $('drive-modal').style.display = 'none';
 }
 
-async function loadMoreGp() {
-  if (!gpNextPageToken || gpLoading) return;
-  const items = await fetchGpPhotos(gpNextPageToken);
-  if (items) appendGpItems(items);
+function appendDriveFiles(files) {
+  const grid = $('drive-grid');
+  files.forEach(file => {
+    driveFiles.push(file);
+    const div = document.createElement('div');
+    div.className = 'drive-item';
+    div.dataset.id = file.id;
+
+    const isVideo = file.mimeType && file.mimeType.startsWith('video/');
+    // サムネイル：thumbnailLinkがあれば使用、なければアイコン
+    const thumb = file.thumbnailLink
+      ? `<img src="${file.thumbnailLink}" alt="" loading="lazy">`
+      : `<div class="drive-no-thumb">${isVideo ? '▶' : '📷'}</div>`;
+
+    div.innerHTML = `
+      ${thumb}
+      <span class="drive-filename">${file.name}</span>
+      ${isVideo ? '<span class="gp-video-badge">動画</span>' : ''}
+    `;
+    div.addEventListener('click', () => div.classList.toggle('selected'));
+    grid.appendChild(div);
+  });
+  $('drive-load-more').style.display = driveNextPageToken ? 'block' : 'none';
 }
 
-async function addSelectedGpPhotos() {
-  const selected = $('gp-grid').querySelectorAll('.gp-item.selected');
-  if (!selected.length) { showMsg('写真を選択してください'); return; }
+async function loadMoreDrive() {
+  if (!driveNextPageToken || driveLoading) return;
+  const folderId = $('folder-select').value;
+  const files = await fetchDriveFiles(driveNextPageToken, folderId || null);
+  appendDriveFiles(files);
+}
+
+async function folderChanged() {
+  driveFiles = [];
+  driveNextPageToken = null;
+  $('drive-grid').innerHTML = '';
+  const folderId = $('folder-select').value;
+  const files = await fetchDriveFiles(null, folderId || null);
+  appendDriveFiles(files);
+}
+
+async function addSelectedDriveFiles() {
+  const selected = $('drive-grid').querySelectorAll('.drive-item.selected');
+  if (!selected.length) { showMsg('ファイルを選択してください'); return; }
 
   const code = padCode(currentPref);
   if (!store[code]) store[code] = [];
 
-  $('gp-add-btn').textContent = '追加中...';
-  $('gp-add-btn').disabled = true;
+  $('drive-add-btn').textContent = '追加中...';
+  $('drive-add-btn').disabled = true;
 
   for (const div of selected) {
-    const item = gpPhotos.find(p => p.id === div.dataset.id);
-    if (!item) continue;
-    const isVideo = item.mediaMetadata && item.mediaMetadata.video;
-    // 動画はダウンロードURL、画像は高解像度URL
-    const url = isVideo
-      ? item.baseUrl + '=dv'
-      : item.baseUrl + '=w1600-h1600';
-    store[code].push({ type: isVideo ? 'video' : 'image', url, id: item.id });
+    const file = driveFiles.find(f => f.id === div.dataset.id);
+    if (!file) continue;
+    const isVideo = file.mimeType && file.mimeType.startsWith('video/');
+    // Drive APIの直接表示URL
+    const url = `https://drive.google.com/uc?export=view&id=${file.id}`;
+    const thumb = file.thumbnailLink || url;
+    store[code].push({
+      type: isVideo ? 'video' : 'image',
+      url: url,
+      thumb: thumb,
+      name: file.name,
+      id: file.id
+    });
   }
 
   saveStore();
@@ -192,13 +229,13 @@ async function addSelectedGpPhotos() {
   if (prefEls[currentPref])
     prefEls[currentPref].classList.toggle('has-photos', store[code].length > 0);
   buildNav($('search-input').value);
-  closeGpModal();
-  $('gp-add-btn').textContent = '追加する';
-  $('gp-add-btn').disabled = false;
+  closeDriveModal();
+  $('drive-add-btn').textContent = '追加する';
+  $('drive-add-btn').disabled = false;
   showMsg(selected.length + '件を追加しました');
 }
 
-// ── ローカルファイル追加 ──────────────────────────────────────────
+// ── ローカルファイル ──────────────────────────────────────────────
 function openLocalPicker() {
   const input = document.createElement('input');
   input.type = 'file';
@@ -207,18 +244,14 @@ function openLocalPicker() {
   input.onchange = async () => {
     const code = padCode(currentPref);
     if (!store[code]) store[code] = [];
-    const files = Array.from(input.files);
-    for (const f of files) {
+    for (const f of Array.from(input.files)) {
       const isVideo = f.type.startsWith('video/');
       const data = await new Promise(res => {
-        const r = new FileReader();
-        r.onload = e => res(e.target.result);
-        r.readAsDataURL(f);
+        const r = new FileReader(); r.onload = e => res(e.target.result); r.readAsDataURL(f);
       });
-      store[code].push({ type: isVideo ? 'video' : 'image', url: data, id: Date.now() + Math.random() });
+      store[code].push({ type: isVideo ? 'video' : 'image', url: data, thumb: data, name: f.name, id: Date.now()+Math.random() });
     }
-    saveStore();
-    renderPhotos();
+    saveStore(); renderPhotos();
     if (prefEls[currentPref])
       prefEls[currentPref].classList.toggle('has-photos', store[code].length > 0);
     buildNav($('search-input').value);
@@ -226,7 +259,7 @@ function openLocalPicker() {
   input.click();
 }
 
-// ── トースト通知 ──────────────────────────────────────────────────
+// ── トースト ──────────────────────────────────────────────────────
 function showMsg(msg) {
   const t = $('toast');
   t.textContent = msg;
@@ -234,7 +267,7 @@ function showMsg(msg) {
   setTimeout(() => t.classList.remove('show'), 3000);
 }
 
-// ── 地図セットアップ ──────────────────────────────────────────────
+// ── 地図 ──────────────────────────────────────────────────────────
 function setupMap() {
   document.querySelectorAll('[data-code]').forEach(g => {
     const raw = g.getAttribute('data-code');
@@ -346,29 +379,22 @@ function renderPhotos() {
   grid.innerHTML = '';
   if (!photos.length) { empty.classList.add('show'); grid.style.display='none'; return; }
   empty.classList.remove('show'); grid.style.display='';
-
   photos.forEach((item, i) => {
     const card = document.createElement('div');
     card.className = 'photo-card';
     if (item.type === 'video') {
-      const vid = document.createElement('video');
-      vid.src = item.url;
-      vid.controls = false;
-      vid.muted = true;
-      vid.loop = true;
-      vid.setAttribute('playsinline','');
-      vid.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
-      vid.addEventListener('mouseenter', () => vid.play());
-      vid.addEventListener('mouseleave', () => { vid.pause(); vid.currentTime=0; });
-      vid.addEventListener('click', () => openLightbox(i));
+      const img = document.createElement('img');
+      img.src = item.thumb || item.url;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+      img.addEventListener('click', () => openLightbox(i));
       const badge = document.createElement('span');
-      badge.className = 'video-badge';
-      badge.textContent = '▶';
-      card.appendChild(vid);
-      card.appendChild(badge);
+      badge.className = 'video-badge'; badge.textContent = '▶ 動画';
+      card.appendChild(img); card.appendChild(badge);
     } else {
       const img = document.createElement('img');
-      img.src = item.url; img.alt=''; img.loading='lazy';
+      img.src = item.thumb || item.url; img.alt=''; img.loading='lazy';
       img.addEventListener('click', () => openLightbox(i));
       card.appendChild(img);
     }
@@ -382,9 +408,7 @@ function renderPhotos() {
 
 function deletePhoto(i) {
   const code = padCode(currentPref);
-  store[code].splice(i,1);
-  saveStore();
-  renderPhotos();
+  store[code].splice(i,1); saveStore(); renderPhotos();
   if (prefEls[currentPref])
     prefEls[currentPref].classList.toggle('has-photos',(store[code]||[]).length>0);
   buildNav($('search-input').value);
@@ -393,8 +417,7 @@ function deletePhoto(i) {
 // ── ライトボックス ────────────────────────────────────────────────
 function openLightbox(i) {
   lbPhotos = store[padCode(currentPref)] || [];
-  lbIndex = i;
-  showLb();
+  lbIndex = i; showLb();
   $('lightbox').classList.add('open');
 }
 function showLb() {
@@ -402,19 +425,18 @@ function showLb() {
   const lbContent = $('lb-content');
   lbContent.innerHTML = '';
   if (item.type === 'video') {
-    const vid = document.createElement('video');
-    vid.src = item.url;
-    vid.controls = true;
-    vid.autoplay = true;
-    vid.style.cssText = 'max-width:82vw;max-height:82vh;border-radius:8px;display:block;';
-    lbContent.appendChild(vid);
+    const a = document.createElement('a');
+    a.href = item.url; a.target = '_blank';
+    a.style.cssText = 'color:#fff;font-size:14px;text-align:center;display:block;padding:20px;';
+    a.textContent = '▶ 動画をGoogleドライブで開く';
+    lbContent.appendChild(a);
   } else {
     const img = document.createElement('img');
     img.src = item.url;
     img.style.cssText = 'max-width:82vw;max-height:82vh;border-radius:8px;display:block;object-fit:contain;';
     lbContent.appendChild(img);
   }
-  $('lb-caption').textContent = (lbIndex+1) + ' / ' + lbPhotos.length;
+  $('lb-caption').textContent = (lbIndex+1) + ' / ' + lbPhotos.length + (item.name ? '  ' + item.name : '');
 }
 function bindLightbox() {
   $('lb-close').addEventListener('click', () => $('lightbox').classList.remove('open'));
@@ -429,28 +451,25 @@ function bindLightbox() {
   });
 }
 
-// ── イベントバインド ──────────────────────────────────────────────
+// ── イベント ──────────────────────────────────────────────────────
 function bindEvents() {
   $('back-btn').addEventListener('click', showMapView);
-  $('add-photo-btn').addEventListener('click', () => {
-    $('add-menu').classList.toggle('open');
-  });
+  $('add-photo-btn').addEventListener('click', () => $('add-menu').classList.toggle('open'));
   $('menu-local').addEventListener('click', () => { $('add-menu').classList.remove('open'); openLocalPicker(); });
-  $('menu-gp').addEventListener('click', () => { $('add-menu').classList.remove('open'); openGpModal(); });
-  $('empty-add-btn').addEventListener('click', () => {
-    if (accessToken) openGpModal(); else openLocalPicker();
-  });
+  $('menu-drive').addEventListener('click', () => { $('add-menu').classList.remove('open'); openDriveModal(); });
+  $('empty-add-btn').addEventListener('click', () => { if (accessToken) openDriveModal(); else openLocalPicker(); });
   document.addEventListener('click', e => {
     if (!e.target.closest('#add-photo-btn') && !e.target.closest('#add-menu'))
       $('add-menu').classList.remove('open');
   });
   $('btn-login').addEventListener('click', loginGoogle);
   $('btn-logout').addEventListener('click', logoutGoogle);
-  $('btn-gp-pick').addEventListener('click', openGpModal);
-  $('gp-close').addEventListener('click', closeGpModal);
-  $('gp-modal-backdrop').addEventListener('click', closeGpModal);
-  $('gp-add-btn').addEventListener('click', addSelectedGpPhotos);
-  $('gp-load-more').addEventListener('click', loadMoreGp);
+  $('btn-drive-pick').addEventListener('click', openDriveModal);
+  $('drive-close').addEventListener('click', closeDriveModal);
+  $('drive-modal-backdrop').addEventListener('click', closeDriveModal);
+  $('drive-add-btn').addEventListener('click', addSelectedDriveFiles);
+  $('drive-load-more').addEventListener('click', loadMoreDrive);
+  $('folder-select').addEventListener('change', folderChanged);
   $('search-input').addEventListener('input', () => buildNav($('search-input').value));
 }
 
@@ -463,15 +482,12 @@ function init() {
   bindDrag();
   bindLightbox();
   bindEvents();
-  // Google Identity Services読み込み後に初期化
-  if (window.google) initGoogleAuth();
-  else window.addEventListener('google-loaded', initGoogleAuth);
 }
 
 window.addEventListener('load', () => {
   const s = document.createElement('script');
   s.src = 'https://accounts.google.com/gsi/client';
-  s.onload = () => { window.dispatchEvent(new Event('google-loaded')); initGoogleAuth(); };
+  s.onload = () => { initGoogleAuth(); };
   document.head.appendChild(s);
 });
 
